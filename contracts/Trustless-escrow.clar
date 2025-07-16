@@ -11,6 +11,7 @@
 (define-data-var next-escrow-id uint u1)
 (define-data-var dispute-fee uint u1000000)
 (define-data-var contract-fee-rate uint u250)
+(define-data-var next-template-id uint u1)
 
 (define-map escrows
   { escrow-id: uint }
@@ -45,6 +46,22 @@
     total-score: uint,
     review-count: uint,
     completed-escrows: uint
+  }
+)
+
+(define-map escrow-templates
+  { template-id: uint }
+  {
+    name: (string-ascii 50),
+    description: (string-ascii 200),
+    category: (string-ascii 30),
+    default-duration: uint,
+    min-amount: uint,
+    max-amount: uint,
+    terms: (string-ascii 300),
+    creator: principal,
+    created-at: uint,
+    is-active: bool
   }
 )
 
@@ -343,4 +360,93 @@
 
 (define-read-only (get-next-escrow-id)
   (var-get next-escrow-id)
+)
+
+(define-public (create-template (name (string-ascii 50)) (description (string-ascii 200)) (category (string-ascii 30)) (default-duration uint) (min-amount uint) (max-amount uint) (terms (string-ascii 300)))
+  (let
+    (
+      (template-id (var-get next-template-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (> (len name) u0) err-invalid-state)
+    (asserts! (> default-duration u0) err-invalid-state)
+    (asserts! (> max-amount min-amount) err-invalid-state)
+    (asserts! (> min-amount u0) err-invalid-state)
+    
+    (map-set escrow-templates
+      { template-id: template-id }
+      {
+        name: name,
+        description: description,
+        category: category,
+        default-duration: default-duration,
+        min-amount: min-amount,
+        max-amount: max-amount,
+        terms: terms,
+        creator: tx-sender,
+        created-at: current-height,
+        is-active: true
+      }
+    )
+    (var-set next-template-id (+ template-id u1))
+    (ok template-id)
+  )
+)
+
+(define-public (create-escrow-from-template (template-id uint) (freelancer principal) (amount uint) (custom-deadline (optional uint)) (additional-description (string-ascii 200)))
+  (let
+    (
+      (template (unwrap! (map-get? escrow-templates { template-id: template-id }) err-not-found))
+      (escrow-id (var-get next-escrow-id))
+      (current-height stacks-block-height)
+      (deadline (default-to (+ current-height (get default-duration template)) custom-deadline))
+      (work-description (concat (get terms template) additional-description))
+    )
+    (asserts! (get is-active template) err-invalid-state)
+    (asserts! (>= amount (get min-amount template)) err-insufficient-funds)
+    (asserts! (<= amount (get max-amount template)) err-invalid-state)
+    (asserts! (> deadline current-height) err-invalid-state)
+    (asserts! (not (is-eq tx-sender freelancer)) err-invalid-state)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    (map-set escrows
+      { escrow-id: escrow-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        amount: amount,
+        deadline: deadline,
+        status: "active",
+        work-description: work-description,
+        created-at: current-height,
+        completed-at: none,
+        disputed-at: none,
+        arbiter: none
+      }
+    )
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-public (toggle-template-status (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? escrow-templates { template-id: template-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get creator template)) err-unauthorized)
+    (map-set escrow-templates
+      { template-id: template-id }
+      (merge template { is-active: (not (get is-active template)) })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-template (template-id uint))
+  (map-get? escrow-templates { template-id: template-id })
+)
+
+(define-read-only (get-next-template-id)
+  (var-get next-template-id)
 )

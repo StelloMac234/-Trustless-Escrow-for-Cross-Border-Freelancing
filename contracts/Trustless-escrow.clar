@@ -12,6 +12,7 @@
 (define-data-var dispute-fee uint u1000000)
 (define-data-var contract-fee-rate uint u250)
 (define-data-var next-template-id uint u1)
+(define-data-var next-milestone-escrow-id uint u1)
 
 (define-map escrows
   { escrow-id: uint }
@@ -62,6 +63,32 @@
     creator: principal,
     created-at: uint,
     is-active: bool
+  }
+)
+
+(define-map milestone-escrows
+  { milestone-escrow-id: uint }
+  {
+    client: principal,
+    freelancer: principal,
+    total-amount: uint,
+    deadline: uint,
+    work-description: (string-ascii 500),
+    created-at: uint,
+    milestone-count: uint,
+    completed-milestones: uint,
+    status: (string-ascii 20)
+  }
+)
+
+(define-map milestones
+  { milestone-escrow-id: uint, milestone-index: uint }
+  {
+    description: (string-ascii 200),
+    amount: uint,
+    status: (string-ascii 20),
+    completed-at: (optional uint),
+    approved-at: (optional uint)
   }
 )
 
@@ -449,4 +476,185 @@
 
 (define-read-only (get-next-template-id)
   (var-get next-template-id)
+)
+
+(define-public (create-milestone-escrow (freelancer principal) (total-amount uint) (deadline uint) (work-description (string-ascii 500)))
+  (let
+    (
+      (milestone-escrow-id (var-get next-milestone-escrow-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (> total-amount u0) err-insufficient-funds)
+    (asserts! (> deadline current-height) err-invalid-state)
+    (asserts! (not (is-eq tx-sender freelancer)) err-invalid-state)
+    
+    (try! (stx-transfer? total-amount tx-sender (as-contract tx-sender)))
+    
+    (map-set milestone-escrows
+      { milestone-escrow-id: milestone-escrow-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        total-amount: total-amount,
+        deadline: deadline,
+        work-description: work-description,
+        created-at: current-height,
+        milestone-count: u0,
+        completed-milestones: u0,
+        status: "setup"
+      }
+    )
+    
+    (var-set next-milestone-escrow-id (+ milestone-escrow-id u1))
+    (ok milestone-escrow-id)
+  )
+)
+
+(define-public (add-milestone (milestone-escrow-id uint) (description (string-ascii 200)) (amount uint))
+  (let
+    (
+      (milestone-escrow (unwrap! (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id }) err-not-found))
+      (current-milestone-count (get milestone-count milestone-escrow))
+    )
+    (asserts! (is-eq tx-sender (get client milestone-escrow)) err-unauthorized)
+    (asserts! (is-eq (get status milestone-escrow) "setup") err-invalid-state)
+    (asserts! (> amount u0) err-insufficient-funds)
+    (asserts! (< current-milestone-count u10) err-invalid-state)
+    
+    (map-set milestones
+      { milestone-escrow-id: milestone-escrow-id, milestone-index: current-milestone-count }
+      {
+        description: description,
+        amount: amount,
+        status: "pending",
+        completed-at: none,
+        approved-at: none
+      }
+    )
+    
+    (map-set milestone-escrows
+      { milestone-escrow-id: milestone-escrow-id }
+      (merge milestone-escrow { milestone-count: (+ current-milestone-count u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (activate-milestone-escrow (milestone-escrow-id uint))
+  (let
+    (
+      (milestone-escrow (unwrap! (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client milestone-escrow)) err-unauthorized)
+    (asserts! (is-eq (get status milestone-escrow) "setup") err-invalid-state)
+    (asserts! (> (get milestone-count milestone-escrow) u0) err-invalid-state)
+    
+    (map-set milestone-escrows
+      { milestone-escrow-id: milestone-escrow-id }
+      (merge milestone-escrow { status: "active" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (complete-milestone (milestone-escrow-id uint) (milestone-index uint))
+  (let
+    (
+      (milestone-escrow (unwrap! (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id }) err-not-found))
+      (milestone (unwrap! (map-get? milestones { milestone-escrow-id: milestone-escrow-id, milestone-index: milestone-index }) err-not-found))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get freelancer milestone-escrow)) err-unauthorized)
+    (asserts! (is-eq (get status milestone-escrow) "active") err-invalid-state)
+    (asserts! (is-eq (get status milestone) "pending") err-invalid-state)
+    (asserts! (< current-height (get deadline milestone-escrow)) err-expired)
+    
+    (map-set milestones
+      { milestone-escrow-id: milestone-escrow-id, milestone-index: milestone-index }
+      (merge milestone {
+        status: "completed",
+        completed-at: (some current-height)
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (approve-milestone (milestone-escrow-id uint) (milestone-index uint))
+  (let
+    (
+      (milestone-escrow (unwrap! (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id }) err-not-found))
+      (milestone (unwrap! (map-get? milestones { milestone-escrow-id: milestone-escrow-id, milestone-index: milestone-index }) err-not-found))
+      (current-height stacks-block-height)
+      (milestone-amount (get amount milestone))
+      (contract-fee (/ (* milestone-amount (var-get contract-fee-rate)) u10000))
+      (freelancer-amount (- milestone-amount contract-fee))
+    )
+    (asserts! (is-eq tx-sender (get client milestone-escrow)) err-unauthorized)
+    (asserts! (is-eq (get status milestone) "completed") err-invalid-state)
+    
+    (try! (as-contract (stx-transfer? freelancer-amount tx-sender (get freelancer milestone-escrow))))
+    (try! (as-contract (stx-transfer? contract-fee tx-sender contract-owner)))
+    
+    (map-set milestones
+      { milestone-escrow-id: milestone-escrow-id, milestone-index: milestone-index }
+      (merge milestone {
+        status: "paid",
+        approved-at: (some current-height)
+      })
+    )
+    
+    (let
+      (
+        (updated-completed (+ (get completed-milestones milestone-escrow) u1))
+      )
+      (map-set milestone-escrows
+        { milestone-escrow-id: milestone-escrow-id }
+        (merge milestone-escrow { completed-milestones: updated-completed })
+      )
+      
+      (if (is-eq updated-completed (get milestone-count milestone-escrow))
+        (begin
+          (map-set milestone-escrows
+            { milestone-escrow-id: milestone-escrow-id }
+            (merge milestone-escrow { status: "completed" })
+          )
+          (update-user-rating (get freelancer milestone-escrow) u5)
+          (update-user-rating (get client milestone-escrow) u5)
+        )
+        true
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-milestone-escrow (milestone-escrow-id uint))
+  (let
+    (
+      (milestone-escrow (unwrap! (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id }) err-not-found))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get client milestone-escrow)) err-unauthorized)
+    (asserts! (is-eq (get status milestone-escrow) "active") err-invalid-state)
+    (asserts! (> current-height (get deadline milestone-escrow)) err-not-expired)
+    
+    (map-set milestone-escrows
+      { milestone-escrow-id: milestone-escrow-id }
+      (merge milestone-escrow { status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-milestone-escrow (milestone-escrow-id uint))
+  (map-get? milestone-escrows { milestone-escrow-id: milestone-escrow-id })
+)
+
+(define-read-only (get-milestone (milestone-escrow-id uint) (milestone-index uint))
+  (map-get? milestones { milestone-escrow-id: milestone-escrow-id, milestone-index: milestone-index })
+)
+
+(define-read-only (get-next-milestone-escrow-id)
+  (var-get next-milestone-escrow-id)
 )

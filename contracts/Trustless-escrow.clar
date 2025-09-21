@@ -7,12 +7,17 @@
 (define-constant err-expired (err u105))
 (define-constant err-not-expired (err u106))
 (define-constant err-already-exists (err u107))
+(define-constant err-unsupported-currency (err u108))
+(define-constant err-invalid-exchange-rate (err u109))
+(define-constant err-currency-mismatch (err u110))
+(define-constant err-stale-exchange-rate (err u111))
 
 (define-data-var next-escrow-id uint u1)
 (define-data-var dispute-fee uint u1000000)
 (define-data-var contract-fee-rate uint u250)
 (define-data-var next-template-id uint u1)
 (define-data-var next-milestone-escrow-id uint u1)
+(define-data-var next-currency-id uint u1)
 
 (define-map escrows
   { escrow-id: uint }
@@ -89,6 +94,36 @@
     status: (string-ascii 20),
     completed-at: (optional uint),
     approved-at: (optional uint)
+  }
+)
+
+(define-map supported-currencies
+  { currency-id: uint }
+  {
+    symbol: (string-ascii 10),
+    name: (string-ascii 50),
+    contract-address: (optional principal),
+    decimals: uint,
+    is-active: bool,
+    added-at: uint
+  }
+)
+
+(define-map currency-exchange-rates
+  { base-currency: uint, quote-currency: uint }
+  {
+    rate: uint,
+    last-updated: uint,
+    oracle: principal
+  }
+)
+
+(define-map multi-currency-escrows
+  { escrow-id: uint }
+  {
+    currency-id: uint,
+    original-amount: uint,
+    stx-equivalent: uint
   }
 )
 
@@ -657,4 +692,217 @@
 
 (define-read-only (get-next-milestone-escrow-id)
   (var-get next-milestone-escrow-id)
+)
+
+(define-public (add-supported-currency 
+  (symbol (string-ascii 10))
+  (name (string-ascii 50))
+  (contract-address (optional principal))
+  (decimals uint))
+  (let
+    (
+      (currency-id (var-get next-currency-id))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (> (len symbol) u0) err-invalid-state)
+    (asserts! (> (len name) u0) err-invalid-state)
+    (asserts! (<= decimals u18) err-invalid-state)
+    
+    (map-set supported-currencies
+      { currency-id: currency-id }
+      {
+        symbol: symbol,
+        name: name,
+        contract-address: contract-address,
+        decimals: decimals,
+        is-active: true,
+        added-at: current-height
+      }
+    )
+    (var-set next-currency-id (+ currency-id u1))
+    (ok currency-id)
+  )
+)
+
+(define-public (toggle-currency-status (currency-id uint))
+  (let
+    (
+      (currency (unwrap! (map-get? supported-currencies { currency-id: currency-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (map-set supported-currencies
+      { currency-id: currency-id }
+      (merge currency { is-active: (not (get is-active currency)) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-exchange-rate 
+  (base-currency uint)
+  (quote-currency uint)
+  (rate uint))
+  (let
+    (
+      (current-height stacks-block-height)
+      (base-curr (unwrap! (map-get? supported-currencies { currency-id: base-currency }) err-unsupported-currency))
+      (quote-curr (unwrap! (map-get? supported-currencies { currency-id: quote-currency }) err-unsupported-currency))
+    )
+    (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+    (asserts! (get is-active base-curr) err-unsupported-currency)
+    (asserts! (get is-active quote-curr) err-unsupported-currency)
+    (asserts! (> rate u0) err-invalid-exchange-rate)
+    (asserts! (not (is-eq base-currency quote-currency)) err-invalid-state)
+    
+    (map-set currency-exchange-rates
+      { base-currency: base-currency, quote-currency: quote-currency }
+      {
+        rate: rate,
+        last-updated: current-height,
+        oracle: tx-sender
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (create-multi-currency-escrow 
+  (freelancer principal)
+  (amount uint)
+  (currency-id uint)
+  (deadline uint)
+  (work-description (string-ascii 500)))
+  (let
+    (
+      (escrow-id (var-get next-escrow-id))
+      (current-height stacks-block-height)
+      (currency (unwrap! (map-get? supported-currencies { currency-id: currency-id }) err-unsupported-currency))
+      (stx-rate-data (map-get? currency-exchange-rates { base-currency: currency-id, quote-currency: u0 }))
+      (stx-equivalent (match stx-rate-data
+        rate-info (/ (* amount (get rate rate-info)) (pow u10 (get decimals currency)))
+        amount))
+    )
+    (asserts! (get is-active currency) err-unsupported-currency)
+    (asserts! (> amount u0) err-insufficient-funds)
+    (asserts! (> deadline current-height) err-invalid-state)
+    (asserts! (not (is-eq tx-sender freelancer)) err-invalid-state)
+    
+    (if (is-eq currency-id u0)
+      (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+      (begin
+        (try! (stx-transfer? stx-equivalent tx-sender (as-contract tx-sender)))
+        (map-set multi-currency-escrows
+          { escrow-id: escrow-id }
+          {
+            currency-id: currency-id,
+            original-amount: amount,
+            stx-equivalent: stx-equivalent
+          }
+        )
+      )
+    )
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        amount: stx-equivalent,
+        deadline: deadline,
+        status: "active",
+        work-description: work-description,
+        created-at: current-height,
+        completed-at: none,
+        disputed-at: none,
+        arbiter: none
+      }
+    )
+    (var-set next-escrow-id (+ escrow-id u1))
+    (ok escrow-id)
+  )
+)
+
+(define-read-only (get-supported-currency (currency-id uint))
+  (map-get? supported-currencies { currency-id: currency-id })
+)
+
+(define-read-only (get-exchange-rate (base-currency uint) (quote-currency uint))
+  (map-get? currency-exchange-rates { base-currency: base-currency, quote-currency: quote-currency })
+)
+
+(define-read-only (get-multi-currency-escrow-info (escrow-id uint))
+  (map-get? multi-currency-escrows { escrow-id: escrow-id })
+)
+
+(define-read-only (convert-currency-amount 
+  (amount uint)
+  (from-currency uint)
+  (to-currency uint))
+  (let
+    (
+      (from-curr (unwrap! (map-get? supported-currencies { currency-id: from-currency }) err-unsupported-currency))
+      (to-curr (unwrap! (map-get? supported-currencies { currency-id: to-currency }) err-unsupported-currency))
+      (rate-data (map-get? currency-exchange-rates { base-currency: from-currency, quote-currency: to-currency }))
+    )
+    (match rate-data
+      rate-info
+        (let
+          (
+            (current-height stacks-block-height)
+            (rate-age (- current-height (get last-updated rate-info)))
+          )
+          (if (< rate-age u144)
+            (ok (/ (* amount (get rate rate-info)) (pow u10 (get decimals from-curr))))
+            err-stale-exchange-rate
+          )
+        )
+      err-invalid-exchange-rate
+    )
+  )
+)
+
+(define-read-only (get-escrow-currency-info (escrow-id uint))
+  (let
+    (
+      (escrow (map-get? escrows { escrow-id: escrow-id }))
+      (multi-currency-info (map-get? multi-currency-escrows { escrow-id: escrow-id }))
+    )
+    (match escrow
+      escrow-data
+        (match multi-currency-info
+          currency-info
+            (some {
+              escrow-amount: (get amount escrow-data),
+              currency-id: (get currency-id currency-info),
+              original-amount: (get original-amount currency-info),
+              stx-equivalent: (get stx-equivalent currency-info)
+            })
+          (some {
+            escrow-amount: (get amount escrow-data),
+            currency-id: u0,
+            original-amount: (get amount escrow-data),
+            stx-equivalent: (get amount escrow-data)
+          })
+        )
+      none
+    )
+  )
+)
+
+(define-read-only (get-next-currency-id)
+  (var-get next-currency-id)
+)
+
+(define-read-only (is-exchange-rate-fresh (base-currency uint) (quote-currency uint) (max-age uint))
+  (let
+    (
+      (rate-data (map-get? currency-exchange-rates { base-currency: base-currency, quote-currency: quote-currency }))
+      (current-height stacks-block-height)
+    )
+    (match rate-data
+      rate-info (< (- current-height (get last-updated rate-info)) max-age)
+      false
+    )
+  )
 )

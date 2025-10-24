@@ -11,6 +11,11 @@
 (define-constant err-invalid-exchange-rate (err u109))
 (define-constant err-currency-mismatch (err u110))
 (define-constant err-stale-exchange-rate (err u111))
+(define-constant err-subscription-not-found (err u112))
+(define-constant err-subscription-inactive (err u113))
+(define-constant err-payment-not-due (err u114))
+(define-constant err-insufficient-balance (err u115))
+(define-constant err-subscription-paused (err u116))
 
 (define-data-var next-escrow-id uint u1)
 (define-data-var dispute-fee uint u1000000)
@@ -18,6 +23,7 @@
 (define-data-var next-template-id uint u1)
 (define-data-var next-milestone-escrow-id uint u1)
 (define-data-var next-currency-id uint u1)
+(define-data-var next-subscription-id uint u1)
 
 (define-map escrows
   { escrow-id: uint }
@@ -124,6 +130,35 @@
     currency-id: uint,
     original-amount: uint,
     stx-equivalent: uint
+  }
+)
+
+(define-map subscriptions
+  { subscription-id: uint }
+  {
+    client: principal,
+    freelancer: principal,
+    payment-amount: uint,
+    billing-cycle: uint,
+    total-deposited: uint,
+    total-paid: uint,
+    last-payment-block: uint,
+    next-payment-block: uint,
+    subscription-start: uint,
+    status: (string-ascii 20),
+    service-description: (string-ascii 300),
+    payments-made: uint,
+    auto-renew: bool
+  }
+)
+
+(define-map subscription-payments
+  { subscription-id: uint, payment-index: uint }
+  {
+    amount: uint,
+    paid-at: uint,
+    period-start: uint,
+    period-end: uint
   }
 )
 
@@ -905,4 +940,252 @@
       false
     )
   )
+)
+
+(define-public (create-subscription
+  (freelancer principal)
+  (payment-amount uint)
+  (billing-cycle uint)
+  (initial-deposit uint)
+  (service-description (string-ascii 300)))
+  (let
+    (
+      (subscription-id (var-get next-subscription-id))
+      (current-height stacks-block-height)
+      (next-payment (+ current-height billing-cycle))
+    )
+    (asserts! (> payment-amount u0) err-insufficient-funds)
+    (asserts! (> billing-cycle u0) err-invalid-state)
+    (asserts! (>= initial-deposit payment-amount) err-insufficient-balance)
+    (asserts! (not (is-eq tx-sender freelancer)) err-invalid-state)
+    
+    (try! (stx-transfer? initial-deposit tx-sender (as-contract tx-sender)))
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      {
+        client: tx-sender,
+        freelancer: freelancer,
+        payment-amount: payment-amount,
+        billing-cycle: billing-cycle,
+        total-deposited: initial-deposit,
+        total-paid: u0,
+        last-payment-block: u0,
+        next-payment-block: next-payment,
+        subscription-start: current-height,
+        status: "active",
+        service-description: service-description,
+        payments-made: u0,
+        auto-renew: false
+      }
+    )
+    
+    (var-set next-subscription-id (+ subscription-id u1))
+    (ok subscription-id)
+  )
+)
+
+(define-public (deposit-to-subscription (subscription-id uint) (amount uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client subscription)) err-unauthorized)
+    (asserts! (or (is-eq (get status subscription) "active") (is-eq (get status subscription) "paused")) err-subscription-inactive)
+    (asserts! (> amount u0) err-insufficient-funds)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { total-deposited: (+ (get total-deposited subscription) amount) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (claim-subscription-payment (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+      (current-height stacks-block-height)
+      (payment-amount (get payment-amount subscription))
+      (contract-fee (/ (* payment-amount (var-get contract-fee-rate)) u10000))
+      (freelancer-amount (- payment-amount contract-fee))
+      (available-balance (- (get total-deposited subscription) (get total-paid subscription)))
+      (payment-index (get payments-made subscription))
+    )
+    (asserts! (is-eq tx-sender (get freelancer subscription)) err-unauthorized)
+    (asserts! (is-eq (get status subscription) "active") err-subscription-inactive)
+    (asserts! (>= current-height (get next-payment-block subscription)) err-payment-not-due)
+    (asserts! (>= available-balance payment-amount) err-insufficient-balance)
+    
+    (try! (as-contract (stx-transfer? freelancer-amount tx-sender (get freelancer subscription))))
+    (try! (as-contract (stx-transfer? contract-fee tx-sender contract-owner)))
+    
+    (map-set subscription-payments
+      { subscription-id: subscription-id, payment-index: payment-index }
+      {
+        amount: payment-amount,
+        paid-at: current-height,
+        period-start: (get next-payment-block subscription),
+        period-end: (+ (get next-payment-block subscription) (get billing-cycle subscription))
+      }
+    )
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        total-paid: (+ (get total-paid subscription) payment-amount),
+        last-payment-block: current-height,
+        next-payment-block: (+ (get next-payment-block subscription) (get billing-cycle subscription)),
+        payments-made: (+ payment-index u1)
+      })
+    )
+    
+    (update-user-rating (get freelancer subscription) u5)
+    (ok true)
+  )
+)
+
+(define-public (pause-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client subscription)) err-unauthorized)
+    (asserts! (is-eq (get status subscription) "active") err-invalid-state)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { status: "paused" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (resume-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+      (current-height stacks-block-height)
+    )
+    (asserts! (is-eq tx-sender (get client subscription)) err-unauthorized)
+    (asserts! (is-eq (get status subscription) "paused") err-subscription-paused)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription {
+        status: "active",
+        next-payment-block: (+ current-height (get billing-cycle subscription))
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (cancel-subscription (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+      (remaining-balance (- (get total-deposited subscription) (get total-paid subscription)))
+    )
+    (asserts! (is-eq tx-sender (get client subscription)) err-unauthorized)
+    (asserts! (or (is-eq (get status subscription) "active") (is-eq (get status subscription) "paused")) err-subscription-inactive)
+    
+    (if (> remaining-balance u0)
+      (try! (as-contract (stx-transfer? remaining-balance tx-sender (get client subscription))))
+      true
+    )
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { status: "cancelled" })
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-auto-renew (subscription-id uint))
+  (let
+    (
+      (subscription (unwrap! (map-get? subscriptions { subscription-id: subscription-id }) err-subscription-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client subscription)) err-unauthorized)
+    (asserts! (or (is-eq (get status subscription) "active") (is-eq (get status subscription) "paused")) err-subscription-inactive)
+    
+    (map-set subscriptions
+      { subscription-id: subscription-id }
+      (merge subscription { auto-renew: (not (get auto-renew subscription)) })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-subscription (subscription-id uint))
+  (map-get? subscriptions { subscription-id: subscription-id })
+)
+
+(define-read-only (get-subscription-payment (subscription-id uint) (payment-index uint))
+  (map-get? subscription-payments { subscription-id: subscription-id, payment-index: payment-index })
+)
+
+(define-read-only (get-subscription-balance (subscription-id uint))
+  (match (map-get? subscriptions { subscription-id: subscription-id })
+    subscription
+      (ok {
+        total-deposited: (get total-deposited subscription),
+        total-paid: (get total-paid subscription),
+        available-balance: (- (get total-deposited subscription) (get total-paid subscription)),
+        payments-remaining: (/ (- (get total-deposited subscription) (get total-paid subscription)) (get payment-amount subscription))
+      })
+    err-subscription-not-found
+  )
+)
+
+(define-read-only (is-payment-due (subscription-id uint))
+  (match (map-get? subscriptions { subscription-id: subscription-id })
+    subscription
+      (let
+        (
+          (current-height stacks-block-height)
+          (next-payment (get next-payment-block subscription))
+          (available-balance (- (get total-deposited subscription) (get total-paid subscription)))
+        )
+        (and
+          (is-eq (get status subscription) "active")
+          (>= current-height next-payment)
+          (>= available-balance (get payment-amount subscription))
+        )
+      )
+    false
+  )
+)
+
+(define-read-only (get-subscription-status (subscription-id uint))
+  (match (map-get? subscriptions { subscription-id: subscription-id })
+    subscription
+      (let
+        (
+          (current-height stacks-block-height)
+          (available-balance (- (get total-deposited subscription) (get total-paid subscription)))
+          (blocks-until-next (if (>= current-height (get next-payment-block subscription))
+                               u0
+                               (- (get next-payment-block subscription) current-height)))
+        )
+        (some {
+          status: (get status subscription),
+          payments-made: (get payments-made subscription),
+          available-balance: available-balance,
+          next-payment-in-blocks: blocks-until-next,
+          is-payment-due: (is-payment-due subscription-id),
+          auto-renew: (get auto-renew subscription)
+        })
+      )
+    none
+  )
+)
+
+(define-read-only (get-next-subscription-id)
+  (var-get next-subscription-id)
 )

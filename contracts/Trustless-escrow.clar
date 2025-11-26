@@ -1189,3 +1189,32 @@
 (define-read-only (get-next-subscription-id)
   (var-get next-subscription-id)
 )
+
+(define-public (add-funds (escrow-id uint) (amount uint))
+  (let
+    (
+      (escrow (unwrap! (map-get? escrows { escrow-id: escrow-id }) err-not-found))
+    )
+    (asserts! (is-eq tx-sender (get client escrow)) err-unauthorized)
+    (asserts! (is-eq (get status escrow) "active") err-invalid-state)
+    (asserts! (> amount u0) err-insufficient-funds)
+    
+    (try! (stx-transfer? amount tx-sender (as-contract tx-sender)))
+    
+    (map-set escrows
+      { escrow-id: escrow-id }
+      (merge escrow { amount: (+ (get amount escrow) amount) })
+    )
+
+    (match (map-get? multi-currency-escrows { escrow-id: escrow-id })
+      mc-data
+      (map-set multi-currency-escrows
+        { escrow-id: escrow-id }
+        (merge mc-data { stx-equivalent: (+ (get stx-equivalent mc-data) amount) })
+      )
+      true
+    )
+    
+    (ok true)
+  )
+)
